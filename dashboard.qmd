@@ -68,29 +68,126 @@ industries <- state_ind_df |>
   pull(industry) |>
   sort()
 
+# ---------------------------------------------------------------------------
+# Trailing-12-month (T12) precomputation for Snapshot and Heatmap tabs
+# T12 window: Mar 2025 – Feb 2026  vs.  Mar 2024 – Feb 2025
+# ---------------------------------------------------------------------------
+
+t12_start_cur  <- as.Date("2025-03-01")
+t12_end_cur    <- as.Date("2026-02-01")
+t12_start_pri  <- as.Date("2024-03-01")
+t12_end_pri    <- as.Date("2025-02-01")
+
+assign_period <- function(df) {
+  df |>
+    mutate(period = case_when(
+      date >= t12_start_cur & date <= t12_end_cur ~ "current",
+      date >= t12_start_pri & date <= t12_end_pri ~ "prior",
+      TRUE ~ NA_character_
+    ))
+}
+
+# State T12 total (for county excess benchmark)
+state_t12_total_yoy <- county_df |>
+  filter(county == "Total", !is.na(retail_sales)) |>
+  assign_period() |>
+  filter(!is.na(period)) |>
+  group_by(period) |>
+  summarise(sales = sum(retail_sales, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = period, values_from = sales) |>
+  mutate(state_yoy = (current / prior - 1) * 100) |>
+  pull(state_yoy)
+
+# County T12 YoY — all 64 counties
+county_t12 <- county_df |>
+  filter(county != "Total", !is.na(retail_sales)) |>
+  assign_period() |>
+  filter(!is.na(period)) |>
+  group_by(county, period) |>
+  summarise(
+    sales     = sum(retail_sales, na.rm = TRUE),
+    n_months  = n(),
+    .groups   = "drop"
+  ) |>
+  pivot_wider(names_from = period, values_from = c(sales, n_months)) |>
+  mutate(
+    yoy    = (sales_current / sales_prior - 1) * 100,
+    excess = yoy - state_t12_total_yoy,
+    # Flag small counties (prior-period T12 < $500M) for context
+    small_county = sales_prior < 500e6
+  )
+
+# Core retail industries (post-2022 NAICS, 0% NA rate in county_industry)
+core_heatmap_inds <- c(
+  "Accommodation",
+  "Building Material and Garden Equipment and Supplies Dealers",
+  "Clothing, Clothing Accessories, Shoe, and Jewelry Retailers",
+  "Food and Beverage Retailers",
+  "Food Services and Drinking Places",
+  "Furniture, Home Furnishings, Electronics, and Appliance Retailers",
+  "Gasoline Stations and Fuel Dealers",
+  "General Merchandise Retailers",
+  "Health and Personal Care Retailers",
+  "Motor Vehicle and Parts Dealers",
+  "Sporting Goods, Hobby, Musical Instrument, Book, and Miscellaneous Retailers"
+)
+
+# State T12 YoY by industry (benchmark for heatmap excess)
+state_ind_t12 <- state_ind_df |>
+  filter(industry %in% core_heatmap_inds, !is.na(retail_sales)) |>
+  assign_period() |>
+  filter(!is.na(period)) |>
+  group_by(industry, period) |>
+  summarise(sales = sum(retail_sales, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = period, values_from = sales) |>
+  mutate(
+    state_yoy   = (current / prior - 1) * 100,
+    sales_t12   = current
+  )
+
+# County × industry T12 YoY with excess vs state industry benchmark
+heatmap_county_ind <- county_ind_df |>
+  filter(industry %in% core_heatmap_inds, !is.na(retail_sales)) |>
+  assign_period() |>
+  filter(!is.na(period)) |>
+  group_by(county, industry, period) |>
+  summarise(sales = sum(retail_sales, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = period, values_from = sales) |>
+  mutate(yoy = (current / prior - 1) * 100) |>
+  left_join(
+    state_ind_t12 |> select(industry, state_yoy),
+    by = "industry"
+  ) |>
+  mutate(excess = yoy - state_yoy)
+
 # Pass key data to OJS
 ojs_define(
-  state_data      = state_yoy,
-  county_data     = county_df |>
+  state_data          = state_yoy,
+  county_data         = county_df |>
     filter(county != "Total") |>
     arrange(county, year, month) |>
     group_by(county) |>
     mutate(yoy = (retail_sales / lag(retail_sales, 12) - 1) * 100) |>
     ungroup(),
-  city_data       = city_df |>
+  city_data           = city_df |>
     arrange(city, year, month) |>
     group_by(city) |>
     mutate(yoy = (retail_sales / lag(retail_sales, 12) - 1) * 100) |>
     ungroup(),
-  county_ind_data = county_ind_df,
-  city_ind_data   = city_ind_df,
-  state_ind_data  = state_ind_df,
-  counties_list   = counties,
-  cities_list     = cities,
-  industries_list = industries,
-  latest_month    = format(latest$date, "%B %Y"),
-  latest_sales    = latest$retail_sales,
-  latest_yoy      = round(state_yoy |> slice_max(date, n = 1) |> pull(yoy), 1)
+  county_ind_data     = county_ind_df,
+  city_ind_data       = city_ind_df,
+  state_ind_data      = state_ind_df,
+  counties_list       = counties,
+  cities_list         = cities,
+  industries_list     = industries,
+  latest_month        = format(latest$date, "%B %Y"),
+  latest_sales        = latest$retail_sales,
+  latest_yoy          = round(state_yoy |> slice_max(date, n = 1) |> pull(yoy), 1),
+  # New: pre-aggregated T12 data for Snapshot and Heatmap tabs
+  county_t12_data     = county_t12,
+  state_ind_t12_data  = state_ind_t12,
+  heatmap_data        = heatmap_county_ind,
+  state_t12_yoy       = round(state_t12_total_yoy, 2)
 )
 ```
 
@@ -615,5 +712,381 @@ viewof out_industry = Inputs.select(
     </span>
     <br/>Geographies above this line are outperforming the state average.
   </div>`
+}
+```
+
+# Snapshot
+
+## Row
+
+::: {.callout-note}
+**Trailing 12-month window:** Mar 2025 – Feb 2026 vs. Mar 2024 – Feb 2025. County growth is compared to the statewide rate (+`{r} round(state_t12_total_yoy, 1)`%) over the same period. Industry rankings reflect statewide totals only.
+:::
+
+## Row
+
+```{ojs}
+//| title: "Counties: Strongest & Weakest vs. State"
+
+{
+  const raw = transpose(county_t12_data)
+
+  // Separate small counties (prior T12 < $500M) for de-emphasis
+  const N = 12  // top/bottom N to show
+
+  const sorted = [...raw]
+    .filter(d => d.yoy != null && !isNaN(d.yoy))
+    .sort((a, b) => b.excess - a.excess)
+
+  // Top N outperformers + bottom N underperformers
+  const top    = sorted.slice(0, N)
+  const bottom = sorted.slice(-N).reverse()
+  const display = [
+    ...top.map(d => ({ ...d, rank_group: "Outperforming" })),
+    ...bottom.map(d => ({ ...d, rank_group: "Underperforming" }))
+  ]
+
+  // Sort for diverging bar: outperformers top, underperformers bottom
+  display.sort((a, b) => b.excess - a.excess)
+
+  return Plot.plot({
+    width: 740,
+    height: 560,
+    marginLeft: 110,
+    x: {
+      label: "Excess growth vs. state T12 (%)",
+      tickFormat: d => `${d > 0 ? "+" : ""}${d.toFixed(1)}%`
+    },
+    y: { label: null },
+    color: {
+      domain: ["Outperforming", "Underperforming"],
+      range: ["#2ca02c", "#d62728"],
+      legend: true
+    },
+    marks: [
+      Plot.barX(display, {
+        x: "excess",
+        y: "county",
+        sort: { y: "-x" },
+        fill: "rank_group",
+        fillOpacity: d => d.small_county ? 0.5 : 0.85,
+        tip: {
+          format: {
+            x: false,
+            fill: false,
+            fillOpacity: false
+          },
+          title: d =>
+            `${d.county}${d.small_county ? " (small county)" : ""}\n` +
+            `T12 growth: ${d.yoy != null ? (d.yoy > 0 ? "+" : "") + d.yoy.toFixed(1) + "%" : "N/A"}\n` +
+            `vs. state: ${d.excess != null ? (d.excess > 0 ? "+" : "") + d.excess.toFixed(1) + " ppts" : "N/A"}`
+        }
+      }),
+      Plot.ruleX([0], { stroke: "#333", strokeWidth: 2 }),
+      Plot.text(display.filter(d => d.excess >= 0), {
+        x: "excess",
+        y: "county",
+        text: d => `+${d.excess.toFixed(1)}%`,
+        dx: 4,
+        fontSize: 10,
+        fill: "#2ca02c",
+        textAnchor: "start"
+      }),
+      Plot.text(display.filter(d => d.excess < 0), {
+        x: "excess",
+        y: "county",
+        text: d => `${d.excess.toFixed(1)}%`,
+        dx: -4,
+        fontSize: 10,
+        fill: "#d62728",
+        textAnchor: "end"
+      })
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "Industries: Statewide Strength & Weakness"
+
+{
+  const raw = transpose(state_ind_t12_data)
+    .filter(d => d.state_yoy != null && !isNaN(d.state_yoy))
+    .sort((a, b) => b.state_yoy - a.state_yoy)
+
+  // Short display labels — full names in tooltip
+  const shortName = {
+    "Accommodation": "Accommodation",
+    "Building Material and Garden Equipment and Supplies Dealers": "Building Materials",
+    "Clothing, Clothing Accessories, Shoe, and Jewelry Retailers": "Clothing & Jewelry",
+    "Food and Beverage Retailers": "Food & Beverage Retail",
+    "Food Services and Drinking Places": "Restaurants & Bars",
+    "Furniture, Home Furnishings, Electronics, and Appliance Retailers": "Furniture & Electronics",
+    "Gasoline Stations and Fuel Dealers": "Gas & Fuel",
+    "General Merchandise Retailers": "General Merchandise",
+    "Health and Personal Care Retailers": "Health & Personal Care",
+    "Motor Vehicle and Parts Dealers": "Motor Vehicles",
+    "Sporting Goods, Hobby, Musical Instrument, Book, and Miscellaneous Retailers": "Sporting Goods & Hobbies"
+  }
+
+  const display = raw.map(d => ({ ...d, label: shortName[d.industry] ?? d.industry }))
+
+  return Plot.plot({
+    width: 740,
+    height: 420,
+    marginLeft: 160,
+    x: {
+      label: "Trailing 12-month YoY growth (%)",
+      tickFormat: d => `${d > 0 ? "+" : ""}${d.toFixed(1)}%`
+    },
+    y: { label: null },
+    color: {
+      domain: [true, false],
+      range: ["#2ca02c", "#d62728"],
+      legend: true,
+      tickFormat: d => d ? "Growing" : "Declining"
+    },
+    marks: [
+      Plot.barX(display, {
+        x: "state_yoy",
+        y: "label",
+        sort: { y: "-x" },
+        fill: d => d.state_yoy >= 0,
+        fillOpacity: 0.85,
+        tip: {
+          format: { x: false, fill: false, fillOpacity: false },
+          title: d =>
+            `${d.industry}\n` +
+            `T12 growth: ${(d.state_yoy > 0 ? "+" : "") + d.state_yoy.toFixed(1)}%\n` +
+            `T12 sales: $${(d.sales_t12 / 1e9).toFixed(2)}B`
+        }
+      }),
+      Plot.ruleX([0], { stroke: "#333", strokeWidth: 2 }),
+      Plot.text(display.filter(d => d.state_yoy >= 0), {
+        x: "state_yoy",
+        y: "label",
+        text: d => `+${d.state_yoy.toFixed(1)}%`,
+        dx: 4,
+        fontSize: 10,
+        fill: "#2ca02c",
+        textAnchor: "start"
+      }),
+      Plot.text(display.filter(d => d.state_yoy < 0), {
+        x: "state_yoy",
+        y: "label",
+        text: d => `${d.state_yoy.toFixed(1)}%`,
+        dx: -4,
+        fontSize: 10,
+        fill: "#d62728",
+        textAnchor: "end"
+      })
+    ]
+  })
+}
+```
+
+# Area × Industry
+
+## Row {.sidebar}
+
+```{ojs}
+viewof hm_metric = Inputs.radio(
+  ["Excess vs. state industry", "Raw YoY growth"],
+  { value: "Excess vs. state industry", label: "Color metric:" }
+)
+
+viewof hm_clamp = Inputs.range(
+  [5, 40],
+  { value: 20, step: 5, label: "Color scale cap (±%):" }
+)
+```
+
+::: {.callout-note style="font-size: 0.85rem; margin-top: 1rem;"}
+**Coverage:** Industry detail is available for the **11 major counties** (Adams, Arapahoe, Boulder, Denver, Douglas, El Paso, Jefferson, Larimer, Mesa, Pueblo, Weld) for 2022–present. Color scale is capped at the selected cap value; actual values appear on hover. Weld County / Sporting Goods contains an anomalous Dec 2025 spike — interpret with caution.
+:::
+
+## Row
+
+```{ojs}
+//| title: "County × Industry Growth Heatmap (Trailing 12 Months)"
+
+{
+  const raw = transpose(heatmap_data)
+
+  // Abbreviate industry names for y-axis
+  const shortInd = {
+    "Accommodation": "Accommodation",
+    "Building Material and Garden Equipment and Supplies Dealers": "Building Materials",
+    "Clothing, Clothing Accessories, Shoe, and Jewelry Retailers": "Clothing & Jewelry",
+    "Food and Beverage Retailers": "Food & Bev Retail",
+    "Food Services and Drinking Places": "Restaurants & Bars",
+    "Furniture, Home Furnishings, Electronics, and Appliance Retailers": "Furniture & Electronics",
+    "Gasoline Stations and Fuel Dealers": "Gas & Fuel",
+    "General Merchandise Retailers": "General Merchandise",
+    "Health and Personal Care Retailers": "Health & Personal Care",
+    "Motor Vehicle and Parts Dealers": "Motor Vehicles",
+    "Sporting Goods, Hobby, Musical Instrument, Book, and Miscellaneous Retailers": "Sporting Goods & Hobbies"
+  }
+
+  const metricCol = hm_metric === "Excess vs. state industry" ? "excess" : "yoy"
+  const cap       = hm_clamp  // user-controlled color scale cap
+
+  const data = raw
+    .filter(d => d[metricCol] != null && !isNaN(d[metricCol]))
+    .map(d => ({
+      ...d,
+      ind_label:     shortInd[d.industry] ?? d.industry,
+      value:         d[metricCol],
+      value_clamped: Math.max(-cap, Math.min(cap, d[metricCol]))
+    }))
+
+  // Sort industry y-axis by statewide T12 YoY (strongest at top)
+  const indOrder = [...d3.rollup(data, v => v[0].state_yoy, d => d.ind_label)]
+    .sort((a, b) => b[1] - a[1])
+    .map(d => d[0])
+
+  const colorLabel = hm_metric === "Excess vs. state industry"
+    ? `Excess growth vs. state industry (ppts, capped ±${cap}%)`
+    : `YoY growth (%, capped ±${cap}%)`
+
+  return Plot.plot({
+    width:      820,
+    height:     420,
+    marginLeft: 165,
+    marginBottom: 80,
+    color: {
+      type:   "diverging",
+      scheme: "RdYlGn",
+      domain: [-cap, cap],
+      label:  colorLabel,
+      legend: true
+    },
+    x: {
+      label:      null,
+      tickRotate: -35,
+      domain:     [...new Set(data.map(d => d.county))].sort()
+    },
+    y: {
+      label:  null,
+      domain: indOrder
+    },
+    marks: [
+      Plot.cell(data, {
+        x:    "county",
+        y:    "ind_label",
+        fill: "value_clamped",
+        tip: {
+          format: { fill: false },
+          title: d => {
+            const metricLabel = hm_metric === "Excess vs. state industry"
+              ? `Excess vs. state: ${(d.excess > 0 ? "+" : "") + d.excess.toFixed(1)} ppts`
+              : `YoY growth: ${(d.yoy > 0 ? "+" : "") + d.yoy.toFixed(1)}%`
+            const stateRef = `State industry T12: ${(d.state_yoy > 0 ? "+" : "") + d.state_yoy.toFixed(1)}%`
+            return `${d.county}\n${d.industry}\n${metricLabel}\n${stateRef}`
+          }
+        }
+      }),
+      // Outline cells that are beyond the color cap (extreme values)
+      Plot.cell(data.filter(d => Math.abs(d.value) > cap), {
+        x:             "county",
+        y:             "ind_label",
+        stroke:        "#333",
+        strokeWidth:   1.5,
+        fill:          "none"
+      })
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "Notable Area × Industry Combinations"
+
+{
+  const raw = transpose(heatmap_data)
+    .filter(d => d.excess != null && !isNaN(d.excess) && d.yoy != null && !isNaN(d.yoy))
+
+  const shortInd = {
+    "Accommodation": "Accommodation",
+    "Building Material and Garden Equipment and Supplies Dealers": "Building Materials",
+    "Clothing, Clothing Accessories, Shoe, and Jewelry Retailers": "Clothing & Jewelry",
+    "Food and Beverage Retailers": "Food & Bev Retail",
+    "Food Services and Drinking Places": "Restaurants & Bars",
+    "Furniture, Home Furnishings, Electronics, and Appliance Retailers": "Furniture & Electronics",
+    "Gasoline Stations and Fuel Dealers": "Gas & Fuel",
+    "General Merchandise Retailers": "General Merchandise",
+    "Health and Personal Care Retailers": "Health & Personal Care",
+    "Motor Vehicle and Parts Dealers": "Motor Vehicles",
+    "Sporting Goods, Hobby, Musical Instrument, Book, and Miscellaneous Retailers": "Sporting Goods & Hobbies"
+  }
+
+  const metricCol = hm_metric === "Excess vs. state industry" ? "excess" : "yoy"
+
+  // Top 8 + bottom 8 county×industry combos by chosen metric
+  const sorted = [...raw].sort((a, b) => b[metricCol] - a[metricCol])
+  const top    = sorted.slice(0, 8).map(d => ({ ...d, group: "Standout" }))
+  const bottom = sorted.slice(-8).reverse().map(d => ({ ...d, group: "Lagging" }))
+  const display = [...top, ...bottom]
+    .sort((a, b) => b[metricCol] - a[metricCol])
+    .map(d => ({
+      ...d,
+      label: `${d.county} / ${shortInd[d.industry] ?? d.industry}`
+    }))
+
+  const xLabel = hm_metric === "Excess vs. state industry"
+    ? "Excess growth vs. state industry (ppts)"
+    : "YoY growth (%)"
+
+  return Plot.plot({
+    width:       740,
+    height:      520,
+    marginLeft:  230,
+    x: {
+      label:      xLabel,
+      tickFormat: d => `${d > 0 ? "+" : ""}${d.toFixed(1)}%`
+    },
+    y: { label: null },
+    color: {
+      domain: ["Standout", "Lagging"],
+      range:  ["#2ca02c", "#d62728"],
+      legend: true
+    },
+    marks: [
+      Plot.dot(display, {
+        x:    metricCol,
+        y:    "label",
+        sort: { y: "-x" },
+        r:    6,
+        fill: "group",
+        tip: {
+          format: { fill: false, r: false },
+          title: d =>
+            `${d.county}\n${d.industry}\n` +
+            `T12 YoY: ${(d.yoy > 0 ? "+" : "") + d.yoy.toFixed(1)}%\n` +
+            `State industry T12: ${(d.state_yoy > 0 ? "+" : "") + d.state_yoy.toFixed(1)}%\n` +
+            `Excess: ${(d.excess > 0 ? "+" : "") + d.excess.toFixed(1)} ppts`
+        }
+      }),
+      Plot.ruleX([0], { stroke: "#333", strokeWidth: 1.5 }),
+      Plot.text(display.filter(d => d[metricCol] >= 0), {
+        x:          metricCol,
+        y:          "label",
+        text:       d => `${(d[metricCol] > 0 ? "+" : "") + d[metricCol].toFixed(1)}%`,
+        dx:         10,
+        fontSize:   10,
+        fill:       "#2ca02c",
+        textAnchor: "start"
+      }),
+      Plot.text(display.filter(d => d[metricCol] < 0), {
+        x:          metricCol,
+        y:          "label",
+        text:       d => `${d[metricCol].toFixed(1)}%`,
+        dx:         -10,
+        fontSize:   10,
+        fill:       "#d62728",
+        textAnchor: "end"
+      })
+    ]
+  })
 }
 ```
