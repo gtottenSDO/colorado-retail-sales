@@ -1,0 +1,48 @@
+name: Refresh dashboard
+
+on:
+  schedule:
+    - cron: '0 14 8 * *'   # 8th of each month at 14:00 UTC
+  workflow_dispatch:         # allow manual trigger
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: 'release'
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            tidyverse
+            readxl
+            arrow
+            janitor
+            scales
+            lubridate
+            quarto
+
+      - uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Collect data
+        run: Rscript R/collect_data.R
+
+      - name: Render dashboard
+        run: quarto render dashboard.qmd
+
+      - name: Copy to docs/
+        run: mkdir -p docs && cp dashboard.html docs/index.html
+
+      - name: Commit updated dashboard
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "Auto-refresh: $(date -u +'%Y-%m-%d')"
+          git push

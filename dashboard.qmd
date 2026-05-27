@@ -3,6 +3,7 @@ title: "Colorado Retail Sales"
 format:
   dashboard:
     theme: cosmo
+    embed-resources: true
     nav-buttons:
       - icon: github
         href: https://cdor.colorado.gov/retail-sales-reports
@@ -16,7 +17,7 @@ execute:
 library(tidyverse)
 library(arrow)
 library(scales)
-library(sdotools)
+if (requireNamespace("sdotools", quietly = TRUE)) library(sdotools)
 
 # Load pre-built parquet files (run R/collect_data.R to refresh)
 state_df          <- read_parquet("data/state.parquet")

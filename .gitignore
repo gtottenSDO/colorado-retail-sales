@@ -6,3 +6,4 @@ reference/
 *_cache/
 _site/
 *.html
+!docs/index.html
