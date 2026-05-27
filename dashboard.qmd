@@ -1,0 +1,590 @@
+---
+title: "Colorado Retail Sales"
+format:
+  dashboard:
+    theme: cosmo
+    nav-buttons:
+      - icon: github
+        href: https://cdor.colorado.gov/retail-sales-reports
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(arrow)
+library(scales)
+library(sdotools)
+
+# Load pre-built parquet files (run R/collect_data.R to refresh)
+state_df          <- read_parquet("data/state.parquet")
+county_df         <- read_parquet("data/county.parquet")
+city_df           <- read_parquet("data/city.parquet")
+county_ind_df     <- read_parquet("data/county_industry.parquet")
+city_ind_df       <- read_parquet("data/city_industry.parquet")
+state_ind_df      <- read_parquet("data/state_industry.parquet")
+
+# Helpers -----------------------------------------------------------------
+
+yoy_growth <- function(df, value_col = retail_sales, group_cols = c()) {
+  df |>
+    arrange(across(all_of(c(group_cols, "year", "month")))) |>
+    group_by(across(all_of(group_cols))) |>
+    mutate(
+      yoy = (.data[[deparse(substitute(value_col))]] /
+               lag(.data[[deparse(substitute(value_col))]], 12) - 1) * 100
+    ) |>
+    ungroup()
+}
+
+# Compute YoY for state
+state_yoy <- state_df |>
+  arrange(year, month) |>
+  mutate(yoy = (retail_sales / lag(retail_sales, 12) - 1) * 100)
+
+# Latest month for headlines
+latest <- state_df |> slice_max(date, n = 1)
+prev_yr <- state_df |>
+  filter(year == latest$year - 1L, month == latest$month) |>
+  slice(1)
+
+# Counties list (excluding "Total" aggregate)
+counties <- county_df |>
+  filter(county != "Total") |>
+  distinct(county) |>
+  pull(county) |>
+  sort()
+
+cities <- city_df |>
+  distinct(city) |>
+  pull(city) |>
+  sort()
+
+industries <- state_ind_df |>
+  filter(industry != "Total") |>
+  distinct(industry) |>
+  pull(industry) |>
+  sort()
+
+# Pass key data to OJS
+ojs_define(
+  state_data      = state_yoy,
+  county_data     = county_df |>
+    filter(county != "Total") |>
+    arrange(county, year, month) |>
+    group_by(county) |>
+    mutate(yoy = (retail_sales / lag(retail_sales, 12) - 1) * 100) |>
+    ungroup(),
+  city_data       = city_df |>
+    arrange(city, year, month) |>
+    group_by(city) |>
+    mutate(yoy = (retail_sales / lag(retail_sales, 12) - 1) * 100) |>
+    ungroup(),
+  county_ind_data = county_ind_df,
+  city_ind_data   = city_ind_df,
+  state_ind_data  = state_ind_df,
+  counties_list   = counties,
+  cities_list     = cities,
+  industries_list = industries,
+  latest_month    = format(latest$date, "%B %Y"),
+  latest_sales    = latest$retail_sales,
+  latest_yoy      = round(state_yoy |> slice_max(date, n = 1) |> pull(yoy), 1)
+)
+```
+
+# State Overview
+
+## Row {height="15%"}
+
+```{r}
+#| content: valuebox
+#| title: "Statewide Retail Sales"
+list(
+  icon  = "shop",
+  color = "primary",
+  value = dollar(latest$retail_sales, scale = 1e-9, suffix = "B", accuracy = 0.1)
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Year-over-Year Change"
+yoy_val <- state_yoy |> slice_max(date, n = 1) |> pull(yoy)
+list(
+  icon  = if (yoy_val >= 0) "arrow-up" else "arrow-down",
+  color = if (yoy_val >= 0) "success" else "danger",
+  value = paste0(sprintf("%+.1f", yoy_val), "%")
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Latest Month"
+list(
+  icon  = "calendar3",
+  color = "secondary",
+  value = format(latest$date, "%B %Y")
+)
+```
+
+## Row
+
+```{ojs}
+//| title: "Monthly Retail Sales (Statewide)"
+
+import { Plot } from "@observablehq/plot"
+
+viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label: "View:" })
+
+{
+  const data = transpose(state_data)
+  const field = time_unit === "Annual" ? "year" : "date"
+
+  let plotData = data.filter(d => !isNaN(d.retail_sales))
+
+  if (time_unit === "Annual") {
+    // Roll up to annual
+    const byYear = d3.rollup(plotData, v => ({
+      year: v[0].year,
+      retail_sales: d3.sum(v, d => d.retail_sales),
+      gross_sales: d3.sum(v, d => d.gross_sales)
+    }), d => d.year)
+    plotData = [...byYear.values()]
+  }
+
+  return Plot.plot({
+    width: 800,
+    height: 320,
+    x: { label: null },
+    y: { label: "Retail Sales ($)", tickFormat: d => `$${(d/1e9).toFixed(1)}B` },
+    marks: [
+      Plot.areaY(plotData, {
+        x: time_unit === "Annual" ? "year" : (d => new Date(d.date)),
+        y: "retail_sales",
+        fill: "#2E6DA4",
+        fillOpacity: 0.2
+      }),
+      Plot.lineY(plotData, {
+        x: time_unit === "Annual" ? "year" : (d => new Date(d.date)),
+        y: "retail_sales",
+        stroke: "#2E6DA4",
+        strokeWidth: 2,
+        tip: true
+      })
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "Year-over-Year Growth Rate"
+
+{
+  const data = transpose(state_data).filter(d => d.yoy != null && !isNaN(d.yoy))
+  return Plot.plot({
+    width: 800,
+    height: 260,
+    x: { label: null },
+    y: { label: "YoY %", tickFormat: d => `${d.toFixed(1)}%` },
+    marks: [
+      Plot.ruleY([0], { stroke: "#999" }),
+      Plot.lineY(data, {
+        x: d => new Date(d.date),
+        y: "yoy",
+        stroke: d => d.yoy >= 0 ? "#2ca02c" : "#d62728",
+        strokeWidth: 2,
+        tip: true
+      })
+    ]
+  })
+}
+```
+
+# Geography
+
+## Row {.sidebar}
+
+```{ojs}
+viewof geo_level = Inputs.radio(["County", "City"], { value: "County", label: "Geography:" })
+
+viewof selected_geos = Inputs.select(
+  geo_level === "County" ? counties_list : cities_list,
+  {
+    value: geo_level === "County"
+      ? counties_list.slice(0, 5)
+      : cities_list.filter(c => ["Denver", "Aurora", "Colorado Springs", "Fort Collins", "Boulder"].includes(c)),
+    multiple: true,
+    label: geo_level === "County" ? "Counties:" : "Cities:",
+    size: 15
+  }
+)
+
+viewof geo_metric = Inputs.radio(
+  ["Retail Sales", "YoY Growth"],
+  { value: "Retail Sales", label: "Metric:" }
+)
+
+viewof geo_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: "View:" })
+```
+
+## Row
+
+```{ojs}
+//| title: "Retail Sales by Geography vs. State Average"
+
+{
+  const raw = geo_level === "County"
+    ? transpose(county_data)
+    : transpose(city_data)
+
+  const geoCol = geo_level === "County" ? "county" : "city"
+  const selected = new Set(selected_geos)
+
+  let data = raw.filter(d => selected.has(d[geoCol]))
+
+  // Aggregate to annual if needed
+  if (geo_time === "Annual") {
+    const grouped = d3.rollup(data, v => ({
+      [geoCol]: v[0][geoCol],
+      year: v[0].year,
+      retail_sales: d3.sum(v, d => d.retail_sales ?? 0)
+    }), d => `${d[geoCol]}_${d.year}`)
+    data = [...grouped.values()]
+  }
+
+  const metric = geo_metric === "YoY Growth" ? "yoy" : "retail_sales"
+  const yFmt   = geo_metric === "YoY Growth"
+    ? d => `${(+d).toFixed(1)}%`
+    : d => `$${(+d / 1e6).toFixed(0)}M`
+  const yLabel = geo_metric === "YoY Growth" ? "YoY %" : "Retail Sales ($M)"
+
+  // State average line for comparison
+  const stateAvg = geo_time === "Annual"
+    ? d3.rollup(
+        transpose(state_data),
+        v => ({ year: v[0].year, retail_sales: d3.sum(v, d => d.retail_sales ?? 0) }),
+        d => d.year
+      )
+    : null
+
+  return Plot.plot({
+    width: 760,
+    height: 360,
+    color: { legend: true },
+    x: { label: null },
+    y: { label: yLabel, tickFormat: yFmt },
+    marks: [
+      Plot.lineY(data, {
+        x: geo_time === "Annual" ? "year" : (d => new Date(d.date)),
+        y: metric,
+        stroke: geoCol,
+        tip: true,
+        strokeWidth: 2
+      }),
+      ...(geo_time === "Annual" && metric === "retail_sales" ? [
+        Plot.lineY([...stateAvg.values()], {
+          x: "year",
+          y: "retail_sales",
+          stroke: "#999",
+          strokeDasharray: "4,3",
+          strokeWidth: 1.5
+        })
+      ] : [])
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "Latest Month: Retail Sales Ranking"
+
+{
+  const raw = geo_level === "County"
+    ? transpose(county_data)
+    : transpose(city_data)
+  const geoCol = geo_level === "County" ? "county" : "city"
+
+  // Most recent date
+  const maxDate = d3.max(raw, d => d.date)
+  const latest  = raw.filter(d => d.date === maxDate && d.retail_sales != null)
+
+  const stateTotal = transpose(state_data).find(d => d.date === maxDate)?.retail_sales ?? 1
+
+  const sorted = latest
+    .sort((a, b) => b.retail_sales - a.retail_sales)
+    .slice(0, 20)
+    .map(d => ({ ...d, share: d.retail_sales / stateTotal * 100 }))
+
+  const selected = new Set(selected_geos)
+
+  return Plot.plot({
+    width: 760,
+    height: 480,
+    marginLeft: 130,
+    x: { label: "Retail Sales", tickFormat: d => `$${(d/1e6).toFixed(0)}M` },
+    y: { label: null },
+    color: { scheme: "tableau10" },
+    marks: [
+      Plot.barX(sorted, {
+        x: "retail_sales",
+        y: geoCol,
+        sort: { y: "-x" },
+        fill: d => selected.has(d[geoCol]) ? "#2E6DA4" : "#ccc",
+        tip: true
+      }),
+      Plot.ruleX([0])
+    ]
+  })
+}
+```
+
+# Industry
+
+## Row {.sidebar}
+
+```{ojs}
+viewof ind_geo_level = Inputs.radio(["State", "County", "City"], { value: "State", label: "Geography:" })
+
+viewof ind_selected_geo = {
+  if (ind_geo_level === "State") return Inputs.text({ value: "Colorado", disabled: true, label: "Area:" })
+  const opts = ind_geo_level === "County" ? counties_list : cities_list
+  return Inputs.select(opts, { value: opts[0], label: "Area:" })
+}
+
+viewof ind_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: "View:" })
+
+viewof selected_industries = Inputs.select(
+  industries_list,
+  {
+    value: industries_list.slice(0, 8),
+    multiple: true,
+    label: "Industries:",
+    size: 12
+  }
+)
+```
+
+## Row
+
+```{ojs}
+//| title: "Retail Sales by Industry"
+
+{
+  let raw, geoCol
+
+  if (ind_geo_level === "State") {
+    raw = transpose(state_ind_data)
+    geoCol = null
+  } else if (ind_geo_level === "County") {
+    raw = transpose(county_ind_data)
+    geoCol = "county"
+  } else {
+    raw = transpose(city_ind_data)
+    geoCol = "city"
+  }
+
+  let data = raw.filter(d =>
+    (geoCol == null || d[geoCol] === ind_selected_geo) &&
+    selected_industries.includes(d.industry) &&
+    d.retail_sales != null
+  )
+
+  if (ind_time === "Annual") {
+    const grouped = d3.rollup(data, v => ({
+      year: v[0].year,
+      industry: v[0].industry,
+      retail_sales: d3.sum(v, d => d.retail_sales ?? 0)
+    }), d => `${d.industry}_${d.year}`)
+    data = [...grouped.values()]
+  }
+
+  return Plot.plot({
+    width: 760,
+    height: 380,
+    color: { legend: true },
+    x: { label: null },
+    y: { label: "Retail Sales", tickFormat: d => `$${(d/1e6).toFixed(0)}M` },
+    marks: [
+      Plot.lineY(data, {
+        x: ind_time === "Annual" ? "year" : (d => new Date(d.date)),
+        y: "retail_sales",
+        stroke: "industry",
+        tip: true,
+        strokeWidth: 1.8
+      })
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "Industry Mix — Latest Month"
+
+{
+  let raw, geoCol
+
+  if (ind_geo_level === "State") {
+    raw = transpose(state_ind_data)
+    geoCol = null
+  } else if (ind_geo_level === "County") {
+    raw = transpose(county_ind_data)
+    geoCol = "county"
+  } else {
+    raw = transpose(city_ind_data)
+    geoCol = "city"
+  }
+
+  const maxDate = d3.max(raw, d => d.date)
+  const latest = raw.filter(d =>
+    d.date === maxDate &&
+    (geoCol == null || d[geoCol] === ind_selected_geo) &&
+    d.industry !== "Total" &&
+    d.retail_sales != null
+  )
+
+  const sorted = [...latest].sort((a, b) => b.retail_sales - a.retail_sales)
+
+  return Plot.plot({
+    width: 760,
+    height: 460,
+    marginLeft: 210,
+    x: { label: "Retail Sales", tickFormat: d => `$${(d/1e6).toFixed(0)}M` },
+    y: { label: null },
+    marks: [
+      Plot.barX(sorted, {
+        x: "retail_sales",
+        y: "industry",
+        sort: { y: "-x" },
+        fill: "#2E6DA4",
+        fillOpacity: 0.8,
+        tip: true
+      }),
+      Plot.ruleX([0])
+    ]
+  })
+}
+```
+
+# Outperformance
+
+## Row
+
+::: {.callout-note}
+**Outperformance** = a county or city whose year-over-year retail sales growth exceeds the statewide rate in the same month. Higher positive values indicate stronger-than-average growth.
+:::
+
+```{ojs}
+//| title: "Controls"
+
+viewof out_geo_level = Inputs.radio(["County", "City"], { value: "County", label: "Geography:" })
+viewof out_year = Inputs.range([2017, 2026], { value: 2025, step: 1, label: "Year:" })
+viewof out_industry = Inputs.select(
+  ["All Industries", ...industries_list],
+  { value: "All Industries", label: "Industry:" }
+)
+```
+
+## Row
+
+```{ojs}
+//| title: "Excess Growth vs. State Average"
+
+{
+  // Annual YoY by geography
+  const raw = out_geo_level === "County"
+    ? transpose(county_data)
+    : transpose(city_data)
+  const geoCol = out_geo_level === "County" ? "county" : "city"
+
+  // State annual totals for reference year and prior
+  const stateByYear = d3.rollup(
+    transpose(state_data),
+    v => d3.sum(v, d => d.retail_sales ?? 0),
+    d => d.year
+  )
+  const stateGrowth = (stateByYear.get(out_year) / stateByYear.get(out_year - 1) - 1) * 100
+
+  // Geo annual totals
+  const geoByYearGeo = d3.rollup(
+    raw.filter(d => d.retail_sales != null),
+    v => d3.sum(v, d => d.retail_sales ?? 0),
+    d => `${d[geoCol]}_${d.year}`
+  )
+
+  const geos = [...new Set(raw.map(d => d[geoCol]))]
+
+  const results = geos.flatMap(geo => {
+    const cur  = geoByYearGeo.get(`${geo}_${out_year}`)     ?? null
+    const prev = geoByYearGeo.get(`${geo}_${out_year - 1}`) ?? null
+    if (!cur || !prev || prev === 0) return []
+    const geoGrowth = (cur / prev - 1) * 100
+    return [{ geo, growth: geoGrowth, excess: geoGrowth - stateGrowth, sales: cur }]
+  })
+
+  const sorted = results.sort((a, b) => b.excess - a.excess).slice(0, 25)
+
+  return Plot.plot({
+    width: 780,
+    height: 540,
+    marginLeft: 140,
+    x: {
+      label: "Excess Growth vs State (%)",
+      tickFormat: d => `${d > 0 ? "+" : ""}${d.toFixed(1)}%`
+    },
+    y: { label: null },
+    color: {
+      domain: [true, false],
+      range: ["#2ca02c", "#d62728"],
+      legend: true,
+      tickFormat: d => d ? "Outperforming" : "Underperforming"
+    },
+    marks: [
+      Plot.barX(sorted, {
+        x: "excess",
+        y: "geo",
+        sort: { y: "-x" },
+        fill: d => d.excess >= 0,
+        tip: {
+          format: {
+            x: d => `${d > 0 ? "+" : ""}${d.toFixed(1)}% vs state`,
+            fill: false
+          }
+        }
+      }),
+      Plot.ruleX([0], { stroke: "#333", strokeWidth: 2 }),
+      Plot.text(sorted.filter(d => d.excess >= 0), {
+        x: "excess",
+        y: "geo",
+        text: d => `+${d.excess.toFixed(1)}%`,
+        dx: 4,
+        fontSize: 11,
+        fill: "#2ca02c",
+        textAnchor: "start"
+      })
+    ]
+  })
+}
+```
+
+```{ojs}
+//| title: "State YoY Benchmark"
+
+{
+  const stateByYear = d3.rollup(
+    transpose(state_data),
+    v => d3.sum(v, d => d.retail_sales ?? 0),
+    d => d.year
+  )
+  const stateGrowth = (stateByYear.get(out_year) / stateByYear.get(out_year - 1) - 1) * 100
+
+  return html`<div style="padding: 1rem; background: #f0f4ff; border-radius: 8px; font-size: 1.1rem;">
+    <strong>State YoY (${out_year}):</strong>
+    <span style="color: ${stateGrowth >= 0 ? '#2ca02c' : '#d62728'}; font-weight: bold;">
+      ${stateGrowth >= 0 ? "+" : ""}${stateGrowth.toFixed(1)}%
+    </span>
+    <br/>Geographies above this line are outperforming the state average.
+  </div>`
+}
+```
