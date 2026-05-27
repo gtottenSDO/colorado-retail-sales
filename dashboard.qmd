@@ -140,16 +140,12 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
 
 {
   const data = transpose(state_data)
-  const field = time_unit === "Annual" ? "year" : "date"
-
   let plotData = data.filter(d => !isNaN(d.retail_sales))
 
   if (time_unit === "Annual") {
-    // Roll up to annual
     const byYear = d3.rollup(plotData, v => ({
       year: v[0].year,
-      retail_sales: d3.sum(v, d => d.retail_sales),
-      gross_sales: d3.sum(v, d => d.gross_sales)
+      retail_sales: d3.sum(v, d => d.retail_sales)
     }), d => d.year)
     plotData = [...byYear.values()]
   }
@@ -157,7 +153,7 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
   return Plot.plot({
     width: 800,
     height: 320,
-    x: { label: null },
+    x: { label: null, tickFormat: d => time_unit === "Annual" ? String(d) : undefined },
     y: { label: "Retail Sales ($)", tickFormat: d => `$${(d/1e9).toFixed(1)}B` },
     marks: [
       Plot.areaY(plotData, {
@@ -241,57 +237,84 @@ viewof geo_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: 
 
   const geoCol = geo_level === "County" ? "county" : "city"
   const selected = new Set(selected_geos)
+  const showYoy  = geo_metric === "YoY Growth"
+  const isAnnual = geo_time === "Annual"
 
   let data = raw.filter(d => selected.has(d[geoCol]))
 
-  // Aggregate to annual if needed
-  if (geo_time === "Annual") {
+  if (isAnnual) {
     const grouped = d3.rollup(data, v => ({
       [geoCol]: v[0][geoCol],
       year: v[0].year,
       retail_sales: d3.sum(v, d => d.retail_sales ?? 0)
     }), d => `${d[geoCol]}_${d.year}`)
     data = [...grouped.values()]
+    // YoY must be computed after annual rollup
+    if (showYoy) {
+      const byGeo = d3.group(data, d => d[geoCol])
+      data = [...byGeo.values()].flatMap(rows => {
+        const sorted = rows.sort((a, b) => a.year - b.year)
+        return sorted.map((d, i) => ({
+          ...d,
+          yoy: i === 0 ? null : (d.retail_sales / sorted[i-1].retail_sales - 1) * 100
+        }))
+      })
+    }
   }
 
-  const metric = geo_metric === "YoY Growth" ? "yoy" : "retail_sales"
-  const yFmt   = geo_metric === "YoY Growth"
-    ? d => `${(+d).toFixed(1)}%`
-    : d => `$${(+d / 1e6).toFixed(0)}M`
-  const yLabel = geo_metric === "YoY Growth" ? "YoY %" : "Retail Sales ($M)"
+  const metric = showYoy ? "yoy" : "retail_sales"
+  const yFmt   = showYoy ? d => `${(+d).toFixed(1)}%` : d => `$${(+d / 1e6).toFixed(0)}M`
+  const yLabel  = showYoy ? "YoY % change" : "Retail Sales ($M)"
 
-  // State average line for comparison
-  const stateAvg = geo_time === "Annual"
-    ? d3.rollup(
-        transpose(state_data),
-        v => ({ year: v[0].year, retail_sales: d3.sum(v, d => d.retail_sales ?? 0) }),
-        d => d.year
-      )
-    : null
+  // State YoY reference line — only meaningful in YoY mode (same scale as geos)
+  let stateRef = []
+  if (showYoy) {
+    const stateRows = transpose(state_data)
+    if (isAnnual) {
+      const byYear = d3.rollup(stateRows, v => d3.sum(v, d => d.retail_sales ?? 0), d => d.year)
+      const years  = [...byYear.keys()].sort()
+      stateRef = years.slice(1).map(yr => ({
+        year: yr,
+        yoy: (byYear.get(yr) / byYear.get(yr - 1) - 1) * 100,
+        label: "State"
+      }))
+    } else {
+      stateRef = stateRows.filter(d => d.yoy != null && !isNaN(d.yoy)).map(d => ({...d, label: "State"}))
+    }
+  }
 
   return Plot.plot({
     width: 760,
     height: 360,
     color: { legend: true },
-    x: { label: null },
+    x: { label: null, tickFormat: isAnnual ? d => String(d) : undefined },
     y: { label: yLabel, tickFormat: yFmt },
     marks: [
-      Plot.lineY(data, {
-        x: geo_time === "Annual" ? "year" : (d => new Date(d.date)),
+      Plot.lineY(data.filter(d => metric === "retail_sales" || (d[metric] != null && !isNaN(d[metric]))), {
+        x: isAnnual ? "year" : (d => new Date(d.date)),
         y: metric,
         stroke: geoCol,
         tip: true,
         strokeWidth: 2
       }),
-      ...(geo_time === "Annual" && metric === "retail_sales" ? [
-        Plot.lineY([...stateAvg.values()], {
-          x: "year",
-          y: "retail_sales",
-          stroke: "#999",
-          strokeDasharray: "4,3",
+      // State YoY reference (only in YoY mode — same scale)
+      ...(!showYoy ? [] : [
+        Plot.lineY(stateRef, {
+          x: isAnnual ? "year" : (d => new Date(d.date)),
+          y: "yoy",
+          stroke: "#888",
+          strokeDasharray: "5,3",
           strokeWidth: 1.5
+        }),
+        Plot.text(stateRef.slice(-1), {
+          x: isAnnual ? "year" : (d => new Date(d.date)),
+          y: "yoy",
+          text: "State avg",
+          dy: -8,
+          fontSize: 11,
+          fill: "#888"
         })
-      ] : [])
+      ])
     ]
   })
 }
@@ -307,8 +330,8 @@ viewof geo_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: 
   const geoCol = geo_level === "County" ? "county" : "city"
 
   // Most recent date
-  const maxDate = d3.max(raw, d => d.date)
-  const latest  = raw.filter(d => d.date === maxDate && d.retail_sales != null)
+  const maxTs  = d3.max(raw, d => +new Date(d.date))
+  const latest = raw.filter(d => +new Date(d.date) === maxTs && d.retail_sales != null)
 
   const stateTotal = transpose(state_data).find(d => d.date === maxDate)?.retail_sales ?? 1
 
@@ -348,9 +371,15 @@ viewof geo_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: 
 viewof ind_geo_level = Inputs.radio(["State", "County", "City"], { value: "State", label: "Geography:" })
 
 viewof ind_selected_geo = {
-  if (ind_geo_level === "State") return Inputs.text({ value: "Colorado", disabled: true, label: "Area:" })
-  const opts = ind_geo_level === "County" ? counties_list : cities_list
-  return Inputs.select(opts, { value: opts[0], label: "Area:" })
+  // Always use Inputs.select to avoid OJS reactivity issues on input-type switch
+  const opts = ind_geo_level === "State"
+    ? ["(Statewide)"]
+    : ind_geo_level === "County" ? counties_list : cities_list
+  return Inputs.select(opts, {
+    value: opts[0],
+    label: "Area:",
+    disabled: ind_geo_level === "State"
+  })
 }
 
 viewof ind_time = Inputs.radio(["Monthly", "Annual"], { value: "Annual", label: "View:" })
@@ -404,7 +433,7 @@ viewof selected_industries = Inputs.select(
     width: 760,
     height: 380,
     color: { legend: true },
-    x: { label: null },
+    x: { label: null, tickFormat: ind_time === "Annual" ? d => String(d) : undefined },
     y: { label: "Retail Sales", tickFormat: d => `$${(d/1e6).toFixed(0)}M` },
     marks: [
       Plot.lineY(data, {
@@ -436,9 +465,9 @@ viewof selected_industries = Inputs.select(
     geoCol = "city"
   }
 
-  const maxDate = d3.max(raw, d => d.date)
+  const maxTs  = d3.max(raw, d => +new Date(d.date))
   const latest = raw.filter(d =>
-    d.date === maxDate &&
+    +new Date(d.date) === maxTs &&
     (geoCol == null || d[geoCol] === ind_selected_geo) &&
     d.industry !== "Total" &&
     d.retail_sales != null
