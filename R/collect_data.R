@@ -49,11 +49,35 @@ ALL_WIDE_CITY        <- c("arvada", "aurora", "boulder", "centennial",
 # Helpers
 # ---------------------------------------------------------------------------
 
-download_xlsx <- function(sheet_id) {
+# Original workbooks are kept here so they can be opened in Excel directly
+RAW_XLSX_DIR <- "data/raw"
+
+download_xlsx <- function(sheet_id, dest_name = NULL) {
   url <- paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/export?format=xlsx")
-  tmp <- tempfile(fileext = ".xlsx")
-  download.file(url, tmp, mode = "wb", quiet = TRUE)
-  tmp
+  if (is.null(dest_name)) {
+    dest <- tempfile(fileext = ".xlsx")
+  } else {
+    dir.create(RAW_XLSX_DIR, recursive = TRUE, showWarnings = FALSE)
+    dest <- file.path(RAW_XLSX_DIR, paste0(dest_name, ".xlsx"))
+  }
+  # Google's export endpoint fails transiently now and then (e.g. HTTP/2
+  # stream errors took down the June 2026 scheduled refresh), so retry
+  for (attempt in 1:3) {
+    ok <- tryCatch(
+      {
+        download.file(url, dest, mode = "wb", quiet = TRUE)
+        TRUE
+      },
+      error = function(e) FALSE,
+      warning = function(w) FALSE
+    )
+    if (ok) return(dest)
+    if (attempt < 3) {
+      message("    download failed (attempt ", attempt, "/3), retrying...")
+      Sys.sleep(5 * attempt)
+    }
+  }
+  stop("Failed to download sheet ", sheet_id, " after 3 attempts")
 }
 
 read_cdor_tab <- function(path, tab_name) {
@@ -121,18 +145,21 @@ read_cdor_tab <- function(path, tab_name) {
   result
 }
 
-read_cdor_workbook <- function(sheet_id) {
-  path      <- download_xlsx(sheet_id)
+read_cdor_workbook <- function(sheet_id, dest_name = NULL) {
+  path      <- download_xlsx(sheet_id, dest_name)
   tab_names <- excel_sheets(path)
   message("    tabs: ", paste(tab_names, collapse = ", "))
   map(tab_names, \(tab) read_cdor_tab(path, tab)) |> compact() |> list_rbind()
 }
 
-read_and_bind <- function(ids, key_cols) {
+read_and_bind <- function(ids, key_cols, dataset = NULL) {
   ids |>
     imap(\(id, period) {
       message("  Fetching ", period, " (", id, ")")
-      read_cdor_workbook(id)
+      read_cdor_workbook(
+        id,
+        dest_name = if (is.null(dataset)) NULL else paste(dataset, period, sep = "_")
+      )
     }) |>
     compact() |>
     list_rbind() |>
@@ -145,27 +172,30 @@ read_and_bind <- function(ids, key_cols) {
 # ---------------------------------------------------------------------------
 
 message("=== State ===")
-state_raw <- read_and_bind(cdor_sheets$state, c("year", "month"))
+state_raw <- read_and_bind(cdor_sheets$state, c("year", "month"), dataset = "state")
 
 message("=== County ===")
-county_raw <- read_and_bind(cdor_sheets$county, c("year", "month", "county"))
+county_raw <- read_and_bind(cdor_sheets$county, c("year", "month", "county"), dataset = "county")
 
 message("=== City ===")
-city_raw <- read_and_bind(cdor_sheets$city, c("year", "month", "city"))
+city_raw <- read_and_bind(cdor_sheets$city, c("year", "month", "city"), dataset = "city")
 
 message("=== County by Industry ===")
 county_industry_raw <- read_and_bind(
-  cdor_sheets$county_industry, c("year", "month", "county", "industry")
+  cdor_sheets$county_industry, c("year", "month", "county", "industry"),
+  dataset = "county_industry"
 )
 
 message("=== City by Industry ===")
 city_industry_raw <- read_and_bind(
-  cdor_sheets$city_industry, c("year", "month", "city", "industry")
+  cdor_sheets$city_industry, c("year", "month", "city", "industry"),
+  dataset = "city_industry"
 )
 
 message("=== State by Industry ===")
 state_industry_raw <- read_and_bind(
-  cdor_sheets$state_industry, c("year", "month", "industry")
+  cdor_sheets$state_industry, c("year", "month", "industry"),
+  dataset = "state_industry"
 )
 
 # ---------------------------------------------------------------------------
@@ -191,4 +221,4 @@ write_parquet(county_industry_raw, "data/county_industry.parquet")
 write_parquet(city_industry_raw,   "data/city_industry.parquet")
 write_parquet(state_industry_raw,  "data/state_industry.parquet")
 
-message("Done. Parquet files written to data/")
+message("Done. Parquet files written to data/; original workbooks saved to ", RAW_XLSX_DIR, "/")
