@@ -60,8 +60,24 @@ download_xlsx <- function(sheet_id, dest_name = NULL) {
     dir.create(RAW_XLSX_DIR, recursive = TRUE, showWarnings = FALSE)
     dest <- file.path(RAW_XLSX_DIR, paste0(dest_name, ".xlsx"))
   }
-  download.file(url, dest, mode = "wb", quiet = TRUE)
-  dest
+  # Google's export endpoint fails transiently now and then (e.g. HTTP/2
+  # stream errors took down the June 2026 scheduled refresh), so retry
+  for (attempt in 1:3) {
+    ok <- tryCatch(
+      {
+        download.file(url, dest, mode = "wb", quiet = TRUE)
+        TRUE
+      },
+      error = function(e) FALSE,
+      warning = function(w) FALSE
+    )
+    if (ok) return(dest)
+    if (attempt < 3) {
+      message("    download failed (attempt ", attempt, "/3), retrying...")
+      Sys.sleep(5 * attempt)
+    }
+  }
+  stop("Failed to download sheet ", sheet_id, " after 3 attempts")
 }
 
 read_cdor_tab <- function(path, tab_name) {
