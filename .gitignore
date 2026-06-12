@@ -7,3 +7,6 @@ reference/
 _site/
 *.html
 !docs/index.html
+
+# Override the global gitignore, which excludes .github/
+!.github/

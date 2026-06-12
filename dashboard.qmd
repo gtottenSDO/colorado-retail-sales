@@ -123,7 +123,13 @@ county_t12 <- county_df |>
   ) |>
   pivot_wider(names_from = period, values_from = c(sales, n_months)) |>
   mutate(
-    yoy = (sales_current / sales_prior - 1) * 100,
+    # Suppressed/missing months would distort the comparison, so growth is
+    # only computed for counties with a full 12 months in both windows
+    yoy = if_else(
+      n_months_current == 12 & n_months_prior == 12,
+      (sales_current / sales_prior - 1) * 100,
+      NA_real_
+    ),
     excess = yoy - state_t12_total_yoy,
     # Flag small counties (prior-period T12 < $500M) for context
     small_county = sales_prior < 500e6
@@ -134,8 +140,11 @@ default_counties <- county_t12 |>
   slice_max(sales_current, n = 5) |>
   pull(county)
 
+# City reporting can lag the statewide series, so rank at the cities' own
+# latest month rather than latest_date
 default_cities <- city_df |>
-  filter(date == latest_date, !is.na(retail_sales)) |>
+  filter(!is.na(retail_sales)) |>
+  filter(date == max(date)) |>
   slice_max(retail_sales, n = 5) |>
   pull(city)
 
@@ -207,6 +216,14 @@ heatmap_county_ind <- county_ind_df |>
     by = "industry"
   ) |>
   mutate(excess = yoy - state_yoy)
+
+# Heatmap caveat that expires once Dec 2025 leaves the T12 window
+weld_note <- if (t12_start_cur <= as.Date("2025-12-01") &&
+  t12_end_cur >= as.Date("2025-12-01")) {
+  " Weld County / Sporting Goods contains an anomalous Dec 2025 spike — interpret with caution."
+} else {
+  ""
+}
 
 # Pass key data to OJS
 ojs_define(
@@ -435,7 +452,7 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
 ## Row
 
 ::: {.callout-note}
-**Trailing 12-month window:** `{r} t12_label_cur` vs. `{r} t12_label_pri`. County growth is compared to the statewide rate (`{r} sprintf("%+.1f", state_t12_total_yoy)`%) over the same period. Industry rankings reflect statewide totals only.
+**Trailing 12-month window:** `{r} t12_label_cur` vs. `{r} t12_label_pri`. County growth is compared to the statewide rate (`{r} sprintf("%+.1f", state_t12_total_yoy)`%) over the same period. Counties without a full 12 months of data in both windows are excluded. Industry rankings reflect statewide totals only.
 :::
 
 ## Row
@@ -961,7 +978,7 @@ viewof hm_clamp = Inputs.range(
 ```
 
 ::: {.callout-note style="font-size: 0.85rem; margin-top: 1rem;"}
-**Coverage:** Industry detail is available for the **`{r} length(ind_counties)` major counties** (`{r} paste(ind_counties, collapse = ", ")`) for 2022–present. Color scale is capped at the selected cap value; actual values appear on hover. Weld County / Sporting Goods contains an anomalous Dec 2025 spike — interpret with caution.
+**Coverage:** Industry detail is available for the **`{r} length(ind_counties)` major counties** (`{r} paste(ind_counties, collapse = ", ")`) for 2022–present. Color scale is capped at the selected cap value; actual values appear on hover.`{r} weld_note`
 :::
 
 ## Row
@@ -1318,27 +1335,143 @@ viewof out_industry = Inputs.select(
 
 **Refreshing the data:** run `R/collect_data.R` to download the latest reports and rebuild the parquet files, then re-render this dashboard. The original Excel workbooks are saved to `data/raw/` for manual inspection.
 
-**Exporting charts:** every chart card has copy and download buttons in its header — use them to grab a high-resolution PNG for presentations.
+**Exporting charts:** every chart card has buttons in its header — copy puts a high-resolution PNG on the clipboard; download saves a scalable SVG that can be resized freely in presentations. (Copy requires a regular browser; embedded viewers such as IDE preview panes may block clipboard access.)
 :::
 
 ::: {.card title="Caveats"}
 - Figures are **not seasonally adjusted** and **not inflation-adjusted**. Use YoY or T12 comparisons rather than month-to-month changes.
 - The **2022 NAICS revision** redefined industry categories. Retired categories are marked "(thru 2021)" in the Industry tab; growth comparisons spanning 2021–2022 partly reflect reclassification rather than real change.
 - Small counties and cities have volatile growth rates; the Snapshot tab de-emphasizes counties under $500M in annual sales.
-- Some city and county values are suppressed or revised by the Department of Revenue; annual comparisons in this dashboard require a full 12 months of data in both years.
+- Some city and county values are suppressed or revised by the Department of Revenue; annual and trailing-12-month comparisons in this dashboard require a full 12 months of data in both periods.
 - Known anomaly: Weld County / Sporting Goods shows an unexplained spike in December 2025.
 :::
 
 ```{=html}
 <script>
 (function() {
-  // Adds copy/download PNG buttons to every dashboard card that contains a
-  // chart, so charts can be dropped straight into presentations.
+  // Adds copy/download buttons to every dashboard card that contains a chart,
+  // so charts can be dropped straight into presentations. Copy puts a PNG on
+  // the clipboard (clipboards don't accept SVG); download saves a scalable
+  // SVG built from native SVG elements only — no foreignObject — so the file
+  // opens correctly in PowerPoint and other Office apps.
 
-  function cardFileName(card) {
+  function cardFileName(card, ext) {
     const header = card.querySelector(".card-header")
     const text = header ? header.textContent.trim() : "chart"
-    return (text.replace(/[^\w\- ]+/g, "").replace(/\s+/g, "_").toLowerCase() || "chart") + ".png"
+    return (text.replace(/[^\w\- ]+/g, "").replace(/\s+/g, "_").toLowerCase() || "chart") + "." + ext
+  }
+
+  const SVG_NS = "http://www.w3.org/2000/svg"
+  const CAPTION_FONT = "11px system-ui, sans-serif"
+  const LEGEND_FONT = "11px system-ui, sans-serif"
+
+  function measureText(text, font) {
+    const ctx = measureText._ctx ?? (measureText._ctx = document.createElement("canvas").getContext("2d"))
+    ctx.font = font
+    return ctx.measureText(text).width
+  }
+
+  function wrapText(text, font, maxWidth) {
+    const lines = []
+    let line = ""
+    for (const word of text.split(/\s+/)) {
+      const candidate = line ? line + " " + word : word
+      if (line && measureText(candidate, font) > maxWidth) {
+        lines.push(line)
+        line = word
+      } else {
+        line = candidate
+      }
+    }
+    if (line) lines.push(line)
+    return lines
+  }
+
+  function svgText(content, x, y, font, fill) {
+    const t = document.createElementNS(SVG_NS, "text")
+    t.setAttribute("x", x)
+    t.setAttribute("y", y)
+    t.setAttribute("style", `font: ${font}; fill: ${fill};`)
+    t.textContent = content
+    return t
+  }
+
+  // Rebuilds the Plot figure as one standalone SVG: nested chart svg(s) kept
+  // as-is, HTML swatch legends redrawn as rects + text, figcaption as text.
+  function figureToSvgEl(fig) {
+    const pad = 8
+    const parts = []  // { el, height } stacked vertically
+    let width = 0
+
+    for (const child of fig.children) {
+      if (child.tagName === "SVG" || child instanceof SVGSVGElement) {
+        // Chart itself, or an svg-based ramp legend — embed directly
+        const clone = child.cloneNode(true)
+        clone.style.maxWidth = "none"
+        const w = +child.getAttribute("width") || child.getBoundingClientRect().width
+        const h = +child.getAttribute("height") || child.getBoundingClientRect().height
+        width = Math.max(width, w)
+        parts.push({ el: clone, height: h, isSvg: true })
+      } else if (child.tagName === "DIV") {
+        // HTML swatch legend: one row of colored squares with labels
+        const swatches = [...child.querySelectorAll("span")].filter(s => s.querySelector("svg"))
+        if (swatches.length === 0) continue
+        const g = document.createElementNS(SVG_NS, "g")
+        let x = pad
+        for (const sw of swatches) {
+          const color = sw.querySelector("svg")?.getAttribute("fill") || "#888"
+          const label = sw.textContent.trim()
+          const rect = document.createElementNS(SVG_NS, "rect")
+          rect.setAttribute("x", x)
+          rect.setAttribute("y", 2)
+          rect.setAttribute("width", 12)
+          rect.setAttribute("height", 12)
+          rect.setAttribute("fill", color)
+          g.appendChild(rect)
+          g.appendChild(svgText(label, x + 16, 12, LEGEND_FONT, "#333"))
+          x += 16 + measureText(label, LEGEND_FONT) + 14
+        }
+        width = Math.max(width, x)
+        parts.push({ el: g, height: 20 })
+      } else if (child.tagName === "FIGCAPTION") {
+        const g = document.createElementNS(SVG_NS, "g")
+        const lines = wrapText(child.textContent.trim(), CAPTION_FONT, Math.max(width - 2 * pad, 200))
+        lines.forEach((line, i) => g.appendChild(svgText(line, pad, 11 + i * 15, CAPTION_FONT, "#666")))
+        parts.push({ el: g, height: lines.length * 15 + 4 })
+      }
+    }
+
+    if (!parts.some(p => p.isSvg)) throw new Error("No chart in this card")
+
+    const totalHeight = parts.reduce((sum, p) => sum + p.height, 0) + pad
+    const out = document.createElementNS(SVG_NS, "svg")
+    out.setAttribute("width", width)
+    out.setAttribute("height", totalHeight)
+    out.setAttribute("viewBox", `0 0 ${width} ${totalHeight}`)
+
+    const bg = document.createElementNS(SVG_NS, "rect")
+    bg.setAttribute("width", width)
+    bg.setAttribute("height", totalHeight)
+    bg.setAttribute("fill", "#fff")
+    out.appendChild(bg)
+
+    let y = pad / 2
+    for (const part of parts) {
+      if (part.isSvg) {
+        part.el.setAttribute("y", y)
+      } else {
+        part.el.setAttribute("transform", `translate(0, ${y})`)
+      }
+      out.appendChild(part.el)
+      y += part.height
+    }
+    return out
+  }
+
+  function figureToSvgBlob(fig) {
+    const xml = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      new XMLSerializer().serializeToString(figureToSvgEl(fig))
+    return new Blob([xml], { type: "image/svg+xml;charset=utf-8" })
   }
 
   async function figureToPngBlob(fig) {
@@ -1427,17 +1560,20 @@ viewof out_industry = Inputs.select(
     group.appendChild(makeButton("bi-copy", "Copy chart to clipboard (PNG)", async () => {
       const fig = getFigure()
       if (!fig) throw new Error("No chart in this card")
-      const blob = await figureToPngBlob(fig)
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
+      // Pass the pending blob promise straight to ClipboardItem — awaiting it
+      // first would expire the user-gesture window in Safari
+      await navigator.clipboard.write([
+        new ClipboardItem({ "image/png": figureToPngBlob(fig) })
+      ])
     }))
 
-    group.appendChild(makeButton("bi-download", "Download chart as PNG", async () => {
+    group.appendChild(makeButton("bi-download", "Download chart as SVG", async () => {
       const fig = getFigure()
       if (!fig) throw new Error("No chart in this card")
-      const blob = await figureToPngBlob(fig)
+      const blob = figureToSvgBlob(fig)
       const a = document.createElement("a")
       a.href = URL.createObjectURL(blob)
-      a.download = cardFileName(card)
+      a.download = cardFileName(card, "svg")
       a.click()
       setTimeout(() => URL.revokeObjectURL(a.href), 5000)
     }))
@@ -1447,14 +1583,24 @@ viewof out_industry = Inputs.select(
     header.appendChild(group)
   }
 
-  // OJS renders asynchronously, so poll briefly for cards that contain charts
-  let tries = 0
-  const timer = setInterval(() => {
+  function scanCards() {
     document.querySelectorAll(".card").forEach(card => {
       if (card.querySelector(".card-body figure svg")) addButtons(card)
     })
-    if (++tries > 40) clearInterval(timer)
-  }, 500)
+  }
+
+  // OJS renders asynchronously (and re-renders on input changes), so watch
+  // the DOM rather than polling — timers are throttled in background tabs
+  scanCards()
+  let scanScheduled = false
+  new MutationObserver(() => {
+    if (scanScheduled) return
+    scanScheduled = true
+    requestAnimationFrame(() => {
+      scanScheduled = false
+      scanCards()
+    })
+  }).observe(document.body, { childList: true, subtree: true })
 })()
 </script>
 ```
