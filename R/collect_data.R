@@ -2,6 +2,7 @@ library(tidyverse)
 library(janitor)
 library(readxl)
 library(arrow)
+library(seasonal)
 
 # ---------------------------------------------------------------------------
 # Sheet IDs from cdor.colorado.gov/retail-sales-reports
@@ -257,6 +258,40 @@ city_raw            <- annotate_annualized(city_raw)
 county_industry_raw <- annotate_annualized(county_industry_raw)
 city_industry_raw   <- annotate_annualized(city_industry_raw)
 state_industry_raw  <- annotate_annualized(state_industry_raw)
+
+# ---------------------------------------------------------------------------
+# Seasonal adjustment — state series only
+# ---------------------------------------------------------------------------
+# X-13ARIMA-SEATS auto-detects outliers (COVID shocks, etc.) and applies
+# trading-day and leap-year adjustments.  Column: retail_sales_sa.
+# Applied to state only; county/city have suppression gaps that need
+# series-by-series review before committing to batch SA.
+
+state_sa_vals <- tryCatch(
+  {
+    state_ordered <- state_raw |> arrange(year, month)
+    state_ts <- ts(
+      state_ordered$retail_sales,
+      start     = c(state_ordered$year[1], state_ordered$month[1]),
+      frequency = 12
+    )
+    fit <- seas(state_ts)
+    message(sprintf(
+      "X-13 seasonal adjustment complete. Obs: %d  AICc: %.0f",
+      length(state_ts),
+      seasonal::udg(fit, "aicc")
+    ))
+    as.numeric(final(fit))
+  },
+  error = function(e) {
+    warning("X-13 seasonal adjustment failed; retail_sales_sa will be NA: ", conditionMessage(e))
+    rep(NA_real_, nrow(state_raw))
+  }
+)
+
+state_raw <- state_raw |>
+  arrange(year, month) |>
+  mutate(retail_sales_sa = state_sa_vals)
 
 # ---------------------------------------------------------------------------
 # Save

@@ -27,6 +27,8 @@ jobs:
             scales
             lubridate
             quarto
+            seasonal
+            x13binary
 
       - uses: quarto-dev/quarto-actions/setup@v2
 
