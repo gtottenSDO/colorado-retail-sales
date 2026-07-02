@@ -60,10 +60,16 @@ download_xlsx <- function(sheet_id, dest_name = NULL, force_refresh = FALSE) {
   } else {
     dir.create(RAW_XLSX_DIR, recursive = TRUE, showWarnings = FALSE)
     dest <- file.path(RAW_XLSX_DIR, paste0(dest_name, ".xlsx"))
-    # Historical files are immutable — skip download if already cached
-    if (!force_refresh && file.exists(dest)) {
-      message("    cached: ", dest)
-      return(dest)
+    # Historical files are immutable — skip download if already cached,
+    # unless the cached file is a truncated/corrupt leftover from an
+    # interrupted prior run.
+    if (!force_refresh && file.exists(dest) && file.size(dest) > 0) {
+      cache_ok <- tryCatch({ excel_sheets(dest); TRUE }, error = function(e) FALSE)
+      if (cache_ok) {
+        message("    cached: ", dest)
+        return(dest)
+      }
+      message("    cached file unreadable, re-downloading: ", dest)
     }
   }
   # Google's export endpoint fails transiently now and then (e.g. HTTP/2
@@ -159,11 +165,14 @@ read_cdor_workbook <- function(sheet_id, dest_name = NULL, force_refresh = FALSE
 }
 
 read_and_bind <- function(ids, key_cols, dataset = NULL) {
+  # Each dataset's id vector lists its open/current period first (e.g.
+  # "2020_present"), followed by closed historical ranges — force-refresh
+  # only that first entry so the data reflects the latest published month.
+  current_period <- names(ids)[1]
+
   ids |>
     imap(\(id, period) {
-      # Always re-download periods that extend into the current year so the
-      # data reflects the latest published month.
-      is_current <- grepl("present|2025", period, ignore.case = TRUE)
+      is_current <- identical(period, current_period)
       message("  Fetching ", period, " (", id, ")",
               if (is_current) " [force refresh]" else " [cached if present]")
       read_cdor_workbook(
@@ -236,28 +245,32 @@ message("Integrity check passed: Adams Co Feb 2026 = $", format(check_val, big.m
 # month's retail_sales by annualized_multiplier then sum — or equivalently,
 # sum the year and multiply the total by the multiplier.
 
-cur_year   <- lubridate::year(Sys.Date())
-n_months   <- state_raw |> filter(year == cur_year) |> distinct(month) |> nrow()
-cur_mult   <- if (n_months > 0) 12 / n_months else 1L
+cur_year <- lubridate::year(Sys.Date())
 
-message(sprintf(
-  "Current year %d: %d month(s) reported → annualized multiplier = %.4f (%.1f×)",
-  cur_year, n_months, cur_mult, cur_mult
-))
+# Each dataset comes from its own Google Sheet and can lag or lead the
+# others in publication, so the multiplier is derived per-dataset rather
+# than shared from a single series.
+annotate_annualized <- function(df, label) {
+  n_months <- df |> filter(year == cur_year) |> distinct(month) |> nrow()
+  cur_mult <- if (n_months > 0) 12 / n_months else 1
 
-annotate_annualized <- function(df) {
+  message(sprintf(
+    "%s %d: %d month(s) reported → annualized multiplier = %.4f (%.1f×)",
+    label, cur_year, n_months, cur_mult, cur_mult
+  ))
+
   df |> mutate(
     is_annualized         = (year == cur_year),
     annualized_multiplier = if_else(is_annualized, cur_mult, 1)
   )
 }
 
-state_raw           <- annotate_annualized(state_raw)
-county_raw          <- annotate_annualized(county_raw)
-city_raw            <- annotate_annualized(city_raw)
-county_industry_raw <- annotate_annualized(county_industry_raw)
-city_industry_raw   <- annotate_annualized(city_industry_raw)
-state_industry_raw  <- annotate_annualized(state_industry_raw)
+state_raw           <- annotate_annualized(state_raw,           "State")
+county_raw          <- annotate_annualized(county_raw,          "County")
+city_raw            <- annotate_annualized(city_raw,            "City")
+county_industry_raw <- annotate_annualized(county_industry_raw, "County industry")
+city_industry_raw   <- annotate_annualized(city_industry_raw,   "City industry")
+state_industry_raw  <- annotate_annualized(state_industry_raw,  "State industry")
 
 # ---------------------------------------------------------------------------
 # Seasonal adjustment — state series only
@@ -267,31 +280,50 @@ state_industry_raw  <- annotate_annualized(state_industry_raw)
 # Applied to state only; county/city have suppression gaps that need
 # series-by-series review before committing to batch SA.
 
-state_sa_vals <- tryCatch(
-  {
-    state_ordered <- state_raw |> arrange(year, month)
-    state_ts <- ts(
-      state_ordered$retail_sales,
-      start     = c(state_ordered$year[1], state_ordered$month[1]),
-      frequency = 12
-    )
-    fit <- seas(state_ts)
-    message(sprintf(
-      "X-13 seasonal adjustment complete. Obs: %d  AICc: %.0f",
-      length(state_ts),
-      seasonal::udg(fit, "aicc")
-    ))
-    as.numeric(final(fit))
-  },
-  error = function(e) {
-    warning("X-13 seasonal adjustment failed; retail_sales_sa will be NA: ", conditionMessage(e))
-    rep(NA_real_, nrow(state_raw))
-  }
-)
+state_ordered <- state_raw |> arrange(year, month)
 
-state_raw <- state_raw |>
-  arrange(year, month) |>
-  mutate(retail_sales_sa = state_sa_vals)
+n_obs           <- nrow(state_ordered)
+expected_months <- (state_ordered$year[n_obs]  - state_ordered$year[1])  * 12 +
+  (state_ordered$month[n_obs] - state_ordered$month[1]) + 1
+has_gap <- n_obs != expected_months
+
+state_ts <- if (has_gap) {
+  warning(sprintf(
+    "State series has a gap (%d month(s) missing between %d-%02d and %d-%02d); skipping X-13 seasonal adjustment",
+    expected_months - n_obs,
+    state_ordered$year[1], state_ordered$month[1],
+    state_ordered$year[n_obs], state_ordered$month[n_obs]
+  ))
+  NULL
+} else {
+  ts(
+    state_ordered$retail_sales,
+    start     = c(state_ordered$year[1], state_ordered$month[1]),
+    frequency = 12
+  )
+}
+
+# Only the fit itself is allowed to fall back to NA — a failure in the
+# diagnostic message below must not discard an already-successful fit.
+fit <- if (is.null(state_ts)) {
+  NULL
+} else {
+  tryCatch(
+    seas(state_ts),
+    error = function(e) {
+      warning("X-13 seasonal adjustment failed; retail_sales_sa will be NA: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+if (!is.null(fit)) {
+  aicc <- tryCatch(seasonal::udg(fit, "aicc"), error = function(e) NA_real_)
+  message(sprintf("X-13 seasonal adjustment complete. Obs: %d  AICc: %.0f", length(state_ts), aicc))
+}
+
+state_ordered$retail_sales_sa <- if (is.null(fit)) NA_real_ else as.numeric(final(fit))
+state_raw <- state_ordered
 
 # ---------------------------------------------------------------------------
 # Save
