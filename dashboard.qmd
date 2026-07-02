@@ -218,8 +218,10 @@ heatmap_county_ind <- county_ind_df |>
   mutate(excess = yoy - state_yoy)
 
 # Heatmap caveat that expires once Dec 2025 leaves the T12 window
-weld_note <- if (t12_start_cur <= as.Date("2025-12-01") &&
-  t12_end_cur >= as.Date("2025-12-01")) {
+weld_note <- if (
+  t12_start_cur <= as.Date("2025-12-01") &&
+    t12_end_cur >= as.Date("2025-12-01")
+) {
   " Weld County / Sporting Goods contains an anomalous Dec 2025 spike — interpret with caution."
 } else {
   ""
@@ -380,10 +382,19 @@ list(
 
 viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label: "View:" })
 
+viewof show_sa = Inputs.checkbox(["Seasonally adjusted"], {
+  value: [],
+  disabled: !hasSaData
+})
+
+hasSaData = transpose(state_data).some(d => d.retail_sales_sa != null && !isNaN(d.retail_sales_sa))
+
 {
   const isAnnual = time_unit === "Annual"
+  const showSa = !isAnnual && show_sa.includes("Seasonally adjusted")
   const data = transpose(state_data).filter(d => d.retail_sales != null && !isNaN(d.retail_sales))
   let plotData = data
+  let projectedPoint = null
 
   if (isAnnual) {
     const byYear = d3.rollup(
@@ -392,7 +403,18 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
       d => d.year
     )
     plotData = [...byYear.values()].sort((a, b) => a.year - b.year)
+
+    // Current (incomplete) year, projected to a full-year total using the
+    // multiplier collect_data.R derives from months reported so far.
+    const projRows = data.filter(d => d.is_annualized && !completeYears.has(d.year))
+    if (projRows.length > 0) {
+      projectedPoint = {
+        year: projRows[0].year,
+        retail_sales: d3.sum(projRows, d => d.retail_sales * d.annualized_multiplier)
+      }
+    }
   }
+  const projectedSeries = projectedPoint ? [plotData[plotData.length - 1], projectedPoint] : []
 
   return Plot.plot({
     width: 800,
@@ -400,8 +422,10 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
     x: isAnnual ? { label: null, tickFormat: d => String(d) } : { label: null },
     y: { label: "Retail sales", tickFormat: fmtUSD },
     caption: isAnnual
-      ? "Complete calendar years only"
-      : `Source: Colorado Dept. of Revenue · Data through ${latest_month}`,
+      ? (projectedPoint
+          ? `Solid years are complete · ${projectedPoint.year} (dashed) is projected from year-to-date data`
+          : "Complete calendar years only")
+      : `Source: Colorado Dept. of Revenue · Data through ${latest_month}${showSa ? " · Seasonally adjusted via X-13ARIMA-SEATS" : ""}`,
     marks: [
       Plot.areaY(plotData, {
         x: isAnnual ? "year" : (d => new Date(d.date)),
@@ -415,7 +439,32 @@ viewof time_unit = Inputs.radio(["Monthly", "Annual"], { value: "Monthly", label
         stroke: "#2E6DA4",
         strokeWidth: 2,
         tip: { format: { y: fmtUSD } }
-      })
+      }),
+      ...(!isAnnual || !projectedPoint ? [] : [
+        Plot.lineY(projectedSeries, {
+          x: "year",
+          y: "retail_sales",
+          stroke: "#2E6DA4",
+          strokeDasharray: "5,3",
+          strokeWidth: 2
+        }),
+        Plot.dot([projectedPoint], {
+          x: "year",
+          y: "retail_sales",
+          r: 5,
+          fill: "#2E6DA4",
+          tip: { format: { y: fmtUSD }, title: d => `${d.year} (projected)` }
+        })
+      ]),
+      ...(!showSa ? [] : [
+        Plot.lineY(data.filter(d => d.retail_sales_sa != null && !isNaN(d.retail_sales_sa)), {
+          x: d => new Date(d.date),
+          y: "retail_sales_sa",
+          stroke: "#d62728",
+          strokeWidth: 1.5,
+          tip: { format: { y: fmtUSD } }
+        })
+      ])
     ]
   })
 }

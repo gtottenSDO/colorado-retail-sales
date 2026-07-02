@@ -10,3 +10,6 @@ _site/
 
 # Override the global gitignore, which excludes .github/
 !.github/
+
+/.quarto/
+**/*.quarto_ipynb
